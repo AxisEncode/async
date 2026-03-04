@@ -31,6 +31,13 @@ task<void> reader(io_context& ctx, int fd) {
     std::cout << "reader got: " << received << "\n";
 }
 
+task<void> yielder(io_context& ctx, std::string& trace, char tag, int rounds) {
+    for (int i = 0; i < rounds; ++i) {
+        trace.push_back(tag);
+        co_await ctx.yield_now();
+    }
+}
+
 int main() {
     int fds[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0) {
@@ -45,6 +52,17 @@ int main() {
         ctx.co_spawn(writer(ctx, fds[0], "hello from coroutine io"));
         ctx.co_spawn(reader(ctx, fds[1]));
         ctx.run();
+
+        io_context yield_ctx;
+        std::string trace;
+        yield_ctx.co_spawn(yielder(yield_ctx, trace, 'A', 3));
+        yield_ctx.co_spawn(yielder(yield_ctx, trace, 'B', 3));
+        yield_ctx.run();
+
+        std::cout << "yield trace: " << trace << "\n";
+        if (trace != "ABABAB") {
+            throw std::runtime_error("yield scheduling mismatch: " + trace);
+        }
 
         ::close(fds[0]);
         ::close(fds[1]);

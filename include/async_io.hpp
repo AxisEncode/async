@@ -219,8 +219,21 @@ public:
         void await_resume() const noexcept {}
     };
 
+    struct yield_awaitable {
+        io_context& ctx;
+
+        bool await_ready() const noexcept { return false; }
+
+        void await_suspend(std::coroutine_handle<> h) {
+            ctx.post(h);
+        }
+
+        void await_resume() const noexcept {}
+    };
+
     fd_awaitable readable(int fd) { return fd_awaitable{*this, fd, POLLIN}; }
     fd_awaitable writable(int fd) { return fd_awaitable{*this, fd, POLLOUT}; }
+    yield_awaitable yield_now() { return yield_awaitable{*this}; }
 
     template <typename Rep, typename Period>
     sleep_awaitable sleep_for(std::chrono::duration<Rep, Period> d) {
