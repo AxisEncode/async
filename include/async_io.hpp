@@ -2,7 +2,6 @@
 
 #include <coroutine>
 #include <cstdint>
-#include <deque>
 #include <errno.h>
 #include <fcntl.h>
 #include <optional>
@@ -11,13 +10,12 @@
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <chrono>
 #include <unistd.h>
 
-namespace async_io {
+namespace as {
 
 template <typename T>
 class task;
@@ -296,6 +294,50 @@ public:
     }
 
 private:
+    class ready_queue {
+    public:
+        bool empty() const noexcept { return size_ == 0; }
+
+        void push_back(std::coroutine_handle<> h) {
+            if (size_ == buffer_.size()) {
+                grow();
+            }
+            buffer_[(head_ + size_) % buffer_.size()] = h;
+            ++size_;
+        }
+
+        std::coroutine_handle<> front() const noexcept {
+            return buffer_[head_];
+        }
+
+        void pop_front() noexcept {
+            head_ = (head_ + 1) % buffer_.size();
+            --size_;
+        }
+
+    private:
+        void grow() {
+            size_t new_capacity = buffer_.empty() ? 64 : buffer_.size() * 2;
+            std::vector<std::coroutine_handle<>> new_buffer(new_capacity);
+            for (size_t i = 0; i < size_; ++i) {
+                new_buffer[i] = buffer_[(head_ + i) % buffer_.size()];
+            }
+            buffer_ = std::move(new_buffer);
+            head_ = 0;
+        }
+
+        std::vector<std::coroutine_handle<>> buffer_;
+        size_t head_{0};
+        size_t size_{0};
+    };
+
+    struct fd_waiters {
+        std::coroutine_handle<> read{};
+        std::coroutine_handle<> write{};
+        size_t active_index{0};
+        bool active{false};
+    };
+
     struct timer_entry {
         std::chrono::steady_clock::time_point when;
         uint64_t seq;
@@ -359,13 +401,54 @@ private:
         --self->active_tasks_;
     }
 
+    void ensure_fd_capacity(int fd) {
+        if (fd < 0) {
+            throw std::invalid_argument("fd must be non-negative");
+        }
+        auto idx = static_cast<size_t>(fd);
+        if (idx >= fd_waiters_.size()) {
+            fd_waiters_.resize(idx + 1);
+        }
+    }
+
+    void track_fd_if_needed(int fd, fd_waiters& slot) {
+        if (slot.active) {
+            return;
+        }
+        slot.active = true;
+        slot.active_index = active_fds_.size();
+        active_fds_.push_back(fd);
+    }
+
+    void untrack_fd_if_unused(int fd, fd_waiters& slot) {
+        if (slot.read || slot.write || !slot.active) {
+            return;
+        }
+        size_t idx = slot.active_index;
+        int moved_fd = active_fds_.back();
+        active_fds_[idx] = moved_fd;
+        fd_waiters_[static_cast<size_t>(moved_fd)].active_index = idx;
+        active_fds_.pop_back();
+        slot.active = false;
+    }
+
     void register_fd(int fd, short events, std::coroutine_handle<> h) {
+        ensure_fd_capacity(fd);
+        auto& slot = fd_waiters_[static_cast<size_t>(fd)];
+
         if (events & POLLIN) {
-            read_waiters_[fd] = h;
+            if (!slot.read) {
+                ++waiter_count_;
+            }
+            slot.read = h;
         }
         if (events & POLLOUT) {
-            write_waiters_[fd] = h;
+            if (!slot.write) {
+                ++waiter_count_;
+            }
+            slot.write = h;
         }
+        track_fd_if_needed(fd, slot);
     }
 
     void add_timer(std::chrono::steady_clock::time_point tp, std::coroutine_handle<> h) {
@@ -392,7 +475,7 @@ private:
     }
 
     bool has_pending_work() const {
-        return active_tasks_ > 0 || !timers_.empty() || !read_waiters_.empty() || !write_waiters_.empty();
+        return active_tasks_ > 0 || !timers_.empty() || waiter_count_ > 0;
     }
 
     int compute_poll_timeout_ms() const {
@@ -409,60 +492,69 @@ private:
     }
 
     std::vector<pollfd> build_pollfds() const {
-        std::unordered_map<int, short> events;
-        events.reserve(read_waiters_.size() + write_waiters_.size());
-
-        for (const auto& [fd, _] : read_waiters_) {
-            events[fd] |= POLLIN;
-        }
-        for (const auto& [fd, _] : write_waiters_) {
-            events[fd] |= POLLOUT;
-        }
-
         std::vector<pollfd> fds;
-        fds.reserve(events.size());
-        for (const auto& [fd, ev] : events) {
-            fds.push_back(pollfd{fd, ev, 0});
+        fds.reserve(active_fds_.size());
+
+        for (int fd : active_fds_) {
+            const auto& slot = fd_waiters_[static_cast<size_t>(fd)];
+            short events = 0;
+            if (slot.read) {
+                events |= POLLIN;
+            }
+            if (slot.write) {
+                events |= POLLOUT;
+            }
+            if (events != 0) {
+                fds.push_back(pollfd{fd, events, 0});
+            }
         }
         return fds;
     }
 
     void resume_fd_waiters(const pollfd& pfd) {
+        if (pfd.fd < 0) {
+            return;
+        }
+        auto idx = static_cast<size_t>(pfd.fd);
+        if (idx >= fd_waiters_.size()) {
+            return;
+        }
+        auto& slot = fd_waiters_[idx];
+
         if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            auto it_r = read_waiters_.find(pfd.fd);
-            if (it_r != read_waiters_.end()) {
-                post(it_r->second);
-                read_waiters_.erase(it_r);
+            if (slot.read) {
+                post(slot.read);
+                slot.read = {};
+                --waiter_count_;
             }
-            auto it_w = write_waiters_.find(pfd.fd);
-            if (it_w != write_waiters_.end()) {
-                post(it_w->second);
-                write_waiters_.erase(it_w);
+            if (slot.write) {
+                post(slot.write);
+                slot.write = {};
+                --waiter_count_;
             }
+            untrack_fd_if_unused(pfd.fd, slot);
             return;
         }
 
-        if ((pfd.revents & POLLIN) != 0) {
-            auto it = read_waiters_.find(pfd.fd);
-            if (it != read_waiters_.end()) {
-                post(it->second);
-                read_waiters_.erase(it);
-            }
+        if ((pfd.revents & POLLIN) != 0 && slot.read) {
+            post(slot.read);
+            slot.read = {};
+            --waiter_count_;
         }
 
-        if ((pfd.revents & POLLOUT) != 0) {
-            auto it = write_waiters_.find(pfd.fd);
-            if (it != write_waiters_.end()) {
-                post(it->second);
-                write_waiters_.erase(it);
-            }
+        if ((pfd.revents & POLLOUT) != 0 && slot.write) {
+            post(slot.write);
+            slot.write = {};
+            --waiter_count_;
         }
+        untrack_fd_if_unused(pfd.fd, slot);
     }
 
-    std::deque<std::coroutine_handle<>> ready_;
+    ready_queue ready_;
     std::priority_queue<timer_entry, std::vector<timer_entry>, std::greater<>> timers_;
-    std::unordered_map<int, std::coroutine_handle<>> read_waiters_;
-    std::unordered_map<int, std::coroutine_handle<>> write_waiters_;
+    std::vector<fd_waiters> fd_waiters_;
+    std::vector<int> active_fds_;
+    size_t waiter_count_{0};
     uint64_t next_timer_seq_{0};
     size_t active_tasks_{0};
     bool stop_requested_{false};
@@ -522,4 +614,4 @@ inline task<ssize_t> async_write(io_context& ctx, int fd, const void* buffer, si
     co_return static_cast<ssize_t>(count - remaining);
 }
 
-}  // namespace async_io
+}  // namespace as

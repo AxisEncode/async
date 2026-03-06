@@ -9,10 +9,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using async_io::async_read;
-using async_io::async_write;
-using async_io::io_context;
-using async_io::task;
+using as::async_read;
+using as::async_write;
+using as::io_context;
+using as::task;
 
 task<void> writer(io_context& ctx, int fd, std::string_view message) {
     co_await ctx.sleep_for(std::chrono::milliseconds(100));
@@ -45,8 +45,8 @@ int main() {
     }
 
     try {
-        async_io::set_non_blocking(fds[0]);
-        async_io::set_non_blocking(fds[1]);
+        as::set_non_blocking(fds[0]);
+        as::set_non_blocking(fds[1]);
 
         io_context ctx;
         ctx.co_spawn(writer(ctx, fds[0], "hello from coroutine io"));
